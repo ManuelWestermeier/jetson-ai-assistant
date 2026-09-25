@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jetson AI</title>
+<style>
+  :root {
+    --bg: #0d0f12;
+    --bg-panel: #15181d;
+    --bg-bubble-user: #2b6cb0;
+    --bg-bubble-assistant: #1e2228;
+    --border: #262a31;
+    --text: #e8eaed;
+    --text-dim: #8a8f98;
+    --accent: #4f9eff;
+    --tool: #a78bfa;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    height: 100%; margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  #app { display: flex; height: 100vh; }
+
+  #sidebar {
+    width: 240px; background: var(--bg-panel); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; padding: 12px;
+  }
+  #sidebar h1 { font-size: 15px; margin: 4px 8px 14px; color: var(--text); }
+  #new-chat {
+    background: var(--accent); color: #fff; border: none; border-radius: 8px;
+    padding: 10px; font-size: 14px; cursor: pointer; margin-bottom: 12px;
+  }
+  #new-chat:hover { opacity: 0.9; }
+  #conv-list { overflow-y: auto; flex: 1; }
+  .conv-item {
+    padding: 10px 8px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .conv-item:hover { background: #1c2026; }
+
+  #main { flex: 1; display: flex; flex-direction: column; }
+  #status-bar {
+    padding: 8px 20px; font-size: 12px; color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+  }
+  #messages {
+    flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px;
+  }
+  .msg { max-width: 720px; display: flex; flex-direction: column; gap: 4px; }
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .msg.assistant { align-self: flex-start; align-items: flex-start; }
+  .bubble {
+    padding: 12px 16px; border-radius: 14px; line-height: 1.5; font-size: 14.5px;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .msg.user .bubble { background: var(--bg-bubble-user); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.assistant .bubble { background: var(--bg-bubble-assistant); border-bottom-left-radius: 4px; }
+
+  .tool-call {
+    font-size: 12px; color: var(--tool); background: #1a1830; border: 1px solid #322a55;
+    border-radius: 8px; padding: 6px 10px; max-width: 720px; align-self: flex-start;
+  }
+  .tool-call .label { font-weight: 600; }
+
+  #input-area {
+    padding: 16px 24px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px;
+  }
+  #input {
+    flex: 1; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 16px; color: var(--text); font-size: 14.5px; resize: none; outline: none;
+    max-height: 160px;
+  }
+  #input:focus { border-color: var(--accent); }
+  #send {
+    background: var(--accent); color: #fff; border: none; border-radius: 12px;
+    padding: 0 22px; font-size: 14px; cursor: pointer;
+  }
+  #send:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-thumb { background: #2a2e35; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="sidebar">
+    <h1>🧠 Jetson AI</h1>
+    <button id="new-chat">+ Neue Unterhaltung</button>
+    <div id="conv-list"></div>
+  </div>
+  <div id="main">
+    <div id="status-bar">Lokal auf Jetson Orin Nano · Modell wird über Ollama geladen</div>
+    <div id="messages"></div>
+    <div id="input-area">
+      <textarea id="input" placeholder="Nachricht eingeben…" rows="1"></textarea>
+      <button id="send">Senden</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let conversationId = null;
+
+const messagesEl = document.getElementById('messages');
+const inputEl = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+const convListEl = document.getElementById('conv-list');
+
+inputEl.addEventListener('input', () => {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
+});
+inputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+sendBtn.addEventListener('click', send);
+document.getElementById('new-chat').addEventListener('click', () => {
+  conversationId = null;
+  messagesEl.innerHTML = '';
+});
+
+function addBubble(role, text) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + role;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = text;
+  wrap.appendChild(bubble);
+  messagesEl.appendChild(wrap);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return bubble;
+}
+
+function addToolNote(text) {
+  const div = document.createElement('div');
+  div.className = 'tool-call';
+  div.innerHTML = text;
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+async function send() {
+  const text = inputEl.value.trim();
+  if (!text) return;
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+  sendBtn.disabled = true;
+
+  addBubble('user', text);
+  const assistantBubble = addBubble('assistant', '');
+
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversation_id: conversationId, message: text }),
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let assistantText = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const evt = JSON.parse(line.slice(6));
+
+        if (evt.type === 'conversation_id') {
+          conversationId = evt.id;
+        } else if (evt.type === 'tool_call') {
+          addToolNote(`<span class="label">🔧 ${evt.name}</span> ${JSON.stringify(evt.arguments)}`);
+        } else if (evt.type === 'tool_result') {
+          // Ergebnis wird bewusst kompakt gehalten
+        } else if (evt.type === 'token') {
+          assistantText += evt.text;
+          assistantBubble.textContent = assistantText;
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        } else if (evt.type === 'done') {
+          loadConversations();
+        }
+      }
+    }
+  } catch (err) {
+    assistantBubble.textContent = 'Fehler: ' + err.message;
+  } finally {
+    sendBtn.disabled = false;
+  }
+}
+
+async function loadConversations() {
+  const res = await fetch('/api/conversations');
+  const convs = await res.json();
+  convListEl.innerHTML = '';
+  for (const c of convs) {
+    const div = document.createElement('div');
+    div.className = 'conv-item';
+    div.textContent = c.title || c.id;
+    div.addEventListener('click', () => openConversation(c.id));
+    convListEl.appendChild(div);
+  }
+}
+
+async function openConversation(id) {
+  conversationId = id;
+  const res = await fetch('/api/conversations/' + id);
+  const history = await res.json();
+  messagesEl.innerHTML = '';
+  for (const m of history) {
+    if (m.role === 'user' || m.role === 'assistant') {
+      addBubble(m.role, m.content);
+    }
+  }
+}
+
+loadConversations();
+</script>
+</body>
+</html>
